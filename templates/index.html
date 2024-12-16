@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Parallax Renderer</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+        }
+
+        .slider {
+            width: 300px;
+            margin-bottom: 20px;
+        }
+
+        .button-container {
+            display: flex;
+            gap: 10px;
+        }
+
+        .button-container button {
+            padding: 10px 20px;
+            font-size: 16px;
+            cursor: pointer;
+        }
+
+        .compare {
+            display: flex;
+            align-items: center;
+            width: 100%;
+            height: auto;
+            gap: 1vw;
+            text-align: center;
+        }
+
+        .compare div iframe,
+        .compare div img {
+            height: 32vw;
+            width: 32vw;
+        }
+    </style>
+</head>
+<body>
+<h1>Parallax Renderer</h1>
+<form id="uploadForm" method="post" enctype="multipart/form-data">
+    <label for="file">Select an image:</label>
+    <input type="file" name="file" id="file" accept="image/*" required>
+    <br><br>
+    <label for="N">Number of Layers (N):</label>
+    <input type="range" name="N" id="N" min="1" max="30" value="10" class="slider">
+    <span id="NValue">10</span>
+    <br><br>
+    <div class="button-container">
+        <button type="submit" name="action" value="parallax">Parallax</button>
+        <button type="submit" name="action" value="depthmap">Depth Map</button>
+        <button type="submit" name="action" value="histogram">Histogram</button>
+    </div>
+    <h2>Mona lisa example with 20 parallax layers</h2>
+    <div class="compare">
+        <div>
+            Original
+            <br>
+            <img src="/static/monalisa.jpg" alt="Mona Lisa">
+        </div>
+        <div>
+            Depth map
+            <br>
+            <img src="/static/depth.png" alt="Mona Lisa Depth">
+        </div>
+        <div>
+            Wiggle cursor for parallax
+            &nbsp;&nbsp;&nbsp;&nbsp;
+            Scroll for strength
+            <br>
+            <iframe src="/monalisa"></iframe>
+        </div>
+    </div>
+</form>
+
+<script>
+    const NSlider = document.getElementById('N');
+    const NValue = document.getElementById('NValue');
+
+    // Update N value display
+    NSlider.addEventListener('input', () => {
+        NValue.textContent = NSlider.value;
+    });
+</script>
+</body>
+</html>

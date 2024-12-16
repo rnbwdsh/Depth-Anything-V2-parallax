@@ -1,6 +1,7 @@
-gradio_imageslider
-gradio==4.29.0
+fastapi
+opencv-python
 matplotlib
 opencv-python
 torch
 torchvision
+fastapi_cache

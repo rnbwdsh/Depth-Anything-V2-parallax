@@ -1,88 +1,102 @@
-import glob
-import gradio as gr
-import matplotlib
+import asyncio
+import base64
+import io
+
+import cv2
+import matplotlib.pyplot as plt
 import numpy as np
-from PIL import Image
-import torch
-import tempfile
-from gradio_imageslider import ImageSlider
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi.templating import Jinja2Templates
+from starlette.responses import StreamingResponse
+from starlette.staticfiles import StaticFiles
 
-from depth_anything_v2.dpt import DepthAnythingV2
+from loader import load
 
-css = """
-#img-display-container {
-    max-height: 100vh;
-}
-#img-display-input {
-    max-height: 80vh;
-}
-#img-display-output {
-    max-height: 80vh;
-}
-#download {
-    height: 62px;
-}
-"""
-DEVICE = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
-model_configs = {
-    'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
-    'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
-    'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
-    'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
-}
-encoder = 'vitl'
-model = DepthAnythingV2(**model_configs[encoder])
-state_dict = torch.load(f'checkpoints/depth_anything_v2_{encoder}.pth', map_location="cpu")
-model.load_state_dict(state_dict)
-model = model.to(DEVICE).eval()
-
-title = "# Depth Anything V2"
-description = """Official demo for **Depth Anything V2**.
-Please refer to our [paper](https://arxiv.org/abs/2406.09414), [project page](https://depth-anything-v2.github.io), or [github](https://github.com/DepthAnything/Depth-Anything-V2) for more details."""
-
-def predict_depth(image):
-    return model.infer_image(image)
-
-with gr.Blocks(css=css) as demo:
-    gr.Markdown(title)
-    gr.Markdown(description)
-    gr.Markdown("### Depth Prediction demo")
-
-    with gr.Row():
-        input_image = gr.Image(label="Input Image", type='numpy', elem_id='img-display-input')
-        depth_image_slider = ImageSlider(label="Depth Map with Slider View", elem_id='img-display-output', position=0.5)
-    submit = gr.Button(value="Compute Depth")
-    gray_depth_file = gr.File(label="Grayscale depth map", elem_id="download",)
-    raw_file = gr.File(label="16-bit raw output (can be considered as disparity)", elem_id="download",)
-
-    cmap = matplotlib.colormaps.get_cmap('Spectral_r')
-
-    def on_submit(image):
-        original_image = image.copy()
-
-        h, w = image.shape[:2]
-
-        depth = predict_depth(image[:, :, ::-1])
-
-        raw_depth = Image.fromarray(depth.astype('uint16'))
-        tmp_raw_depth = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
-        raw_depth.save(tmp_raw_depth.name)
-
-        depth = (depth - depth.min()) / (depth.max() - depth.min()) * 255.0
-        depth = depth.astype(np.uint8)
-        colored_depth = (cmap(depth)[:, :, :3] * 255).astype(np.uint8)
-
-        gray_depth = Image.fromarray(depth)
-        tmp_gray_depth = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
-        gray_depth.save(tmp_gray_depth.name)
-
-        return [(original_image, colored_depth), tmp_gray_depth.name, tmp_raw_depth.name]
-
-    submit.click(on_submit, inputs=[input_image], outputs=[depth_image_slider, gray_depth_file, raw_file])
-
-    example_files = glob.glob('assets/examples/*')
-    examples = gr.Examples(examples=example_files, inputs=[input_image], outputs=[depth_image_slider, gray_depth_file, raw_file], fn=on_submit)
+app = FastAPI(docs_url="/docs", redoc_url=None, static_url_path="/static")
+app.mount("/static", StaticFiles(directory="static"), name="static")
+templates = Jinja2Templates(directory="templates")
+depth_anything = load("vits")
+cache = None
 
 
-if __name__ == '__main__':
-    demo.queue().launch()
+def encode_image_to_base64(image):
+    _, buffer = cv2.imencode('.png', image)
+    return base64.b64encode(buffer).decode('utf-8')
+
+
+@app.get("/")
+async def index():
+    return templates.TemplateResponse("index.html", {"request": {}})
+
+
+@app.post("/")
+async def handle_form(file: UploadFile = File(...), N: int = Form(10), action: str = Form(...)):
+    raw_image = cv2.imdecode(np.frombuffer(await file.read(), np.uint8), cv2.IMREAD_COLOR)
+    maxsize = 2000
+    if raw_image.shape[0] > maxsize or raw_image.shape[1] > maxsize:
+        largest_side = max(raw_image.shape[:2])
+        # scale the larger size to 2000 and the other size proportionally
+        scale_factor = maxsize / largest_side
+        raw_image = cv2.resize(raw_image, (int(raw_image.shape[1] * scale_factor), int(raw_image.shape[0] * scale_factor)))
+
+    cv2.imwrite(f"uploads/{file.filename}", raw_image)
+    depth = depth_anything.infer_image(raw_image)
+    depth = (depth - depth.min()) / (depth.max() - depth.min()) * 255.0
+    depth_val = depth.flatten()
+    depth_val = depth_val[depth_val > 0]
+    # depth_val = depth_val[depth_val < 255]
+    depth_val = np.sort(depth_val)
+    if action == "depthmap":
+        depth = np.repeat(depth[..., np.newaxis], 3, axis=-1)
+        _, buffer = cv2.imencode('.png', depth.astype(np.uint8))
+        return StreamingResponse(io.BytesIO(buffer), media_type="image/png")
+
+    quantiles = [int(depth_val[int(i * len(depth_val) / N)]) for i in range(N)] + [255]
+    tolerance = np.ceil(N / 10)
+    if action == "parallax":
+        depths = []
+        layers = {}
+        for i in range(len(quantiles) - 1):
+            lq, hq = quantiles[i], quantiles[i + 1]
+            mask = (depth >= lq - tolerance) & (depth <= hq + tolerance)
+            mask = np.repeat(mask[..., np.newaxis], 3, axis=-1)
+            masked_image = raw_image * mask
+            masked_image = np.concatenate([masked_image, mask[:, :, 0:1] * 255], axis=2)
+            depths.append(lq + hq // 2)
+            layers[hq] = encode_image_to_base64(masked_image)
+
+        # value that must be over 255. shift is defined by 1/(bg-height)
+        bg = 300
+        layers[bg] = encode_image_to_base64(cv2.GaussianBlur(raw_image, (5, 5), 0))
+        depths = sorted(layers.keys())
+        return templates.TemplateResponse("parallax.html", {"request": {}, "layers": layers, "depths": depths, "bg": bg})
+
+    elif action == "histogram":
+        plt.hist(depth_val, bins=256)
+        # add vertical lines for the quantiles
+        for q in quantiles:
+            plt.axvline(q, color='r', linestyle='dashed', linewidth=1)
+        buffer = io.BytesIO()
+        plt.savefig(buffer, format='jpg')
+        plt.close()
+        buffer.seek(0)
+        return StreamingResponse(buffer, media_type="image/jpg")
+
+    else:
+        raise HTTPException(status_code=400, detail="Invalid action specified.")
+
+
+@app.get("/monalisa")
+def monalisa_parallax():
+    global cache
+    if cache is None:
+        with open("static/monalisa.jpg", "rb") as f:
+            file = UploadFile(f, filename="static/monalisa.jpg")
+            cache = asyncio.run(handle_form(file, 20, "parallax"))
+    return cache
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="localhost", port=3000)
